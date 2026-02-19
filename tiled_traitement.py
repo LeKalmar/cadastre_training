@@ -16,7 +16,7 @@ import gc
 import cv2
 
 class TiledInference:
-    def __init__(self, checkpoint_path, tile_size=1024, overlap=128):
+    def __init__(self, checkpoint_path, tile_size=2048, overlap=256):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # Charger modèle
@@ -135,6 +135,7 @@ class TiledInference:
         Image.fromarray(mask_binary).save(mask_path)
         print(f"✅ Résultat sauvegardé: {mask_path}")
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint', required=True)
@@ -143,9 +144,19 @@ def main():
     parser.add_argument('--threshold', type=float, default=0.4)
     parser.add_argument('--skeleton', action='store_true', help='Activer la squelettisation')
 
+    # Nouveaux arguments
+    parser.add_argument('--tile-size', type=int, default=1024, help='Taille de la tuile (ex: 2048)')
+    parser.add_argument('--overlap', type=int, default=128, help='Recouvrement entre les tuiles (ex: 256)')
+
     args = parser.parse_args()
-    processor = TiledInference(args.checkpoint)
-    
+
+    # On passe maintenant les arguments au constructeur
+    processor = TiledInference(
+        checkpoint_path=args.checkpoint,
+        tile_size=args.tile_size,
+        overlap=args.overlap
+    )
+
     mask_binary, original_image = processor.predict_large_image(
         args.input, threshold=args.threshold, apply_skeleton=args.skeleton
     )

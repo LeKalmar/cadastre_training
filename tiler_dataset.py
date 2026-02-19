@@ -66,7 +66,7 @@ def tile_dataset(base_dir, output_dir, tile_size=512, overlap=0):
 if __name__ == "__main__":
     # Adapte les chemins ici si nécessaire
     tile_dataset(
-        base_dir="data/dataset", 
+        base_dir="data/dataset_remaster",
         output_dir="data/cadastre_lines_tiled", 
         tile_size=512, 
         overlap=64 # Un peu d'overlap aide l'IA à voir les lignes coupées
