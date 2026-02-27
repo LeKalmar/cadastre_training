@@ -1,806 +1,576 @@
 #!/usr/bin/env python3
 """
-Script d'entraînement pour segmentation de cadastres napoléoniens
-v2.0 - Corrections NaN + Encodeur pré-entraîné + Stabilité numérique
+Cadastre training v5 - Tversky Loss pour contrôle direct P/R
 
-Dépendances à installer :
-    pip install segmentation-models-pytorch albumentations opencv-python-headless tqdm matplotlib
+Approche: Au lieu de manipuler pos_weight (qui n'affecte que la BCE),
+on utilise la Tversky Loss qui permet de contrôler DIRECTEMENT le
+compromis precision/recall via alpha et beta:
+  - alpha > beta → pénalise les faux positifs → meilleure precision
+  - alpha < beta → pénalise les faux négatifs → meilleur recall
 
-Changements vs v1.0 :
-    - Encodeur pré-entraîné (ResNet34) via segmentation-models-pytorch
-    - Suppression de GradScaler (incompatible avec bfloat16)
-    - Protection NaN dans la boucle d'entraînement
-    - Augmentations agressives pour gérer la diversité des feuilles
-    - Cosine Annealing scheduler + warmup
-    - Early stopping
-    - Meilleure gestion du pos_weight dynamique
-    - Logging complet et checkpoint amélioré
+Combinaison: Tversky(0.4) + Skeleton(0.3) + BCE(0.3)
+
+Usage:
+    # From scratch avec Tversky (recommandé)
+    python train_v5.py --batch-size 8 --epochs 300 --lr 3e-4 \
+        --work-dir work_dirs/Desailly_v5
+
+    # Fine-tune depuis v2
+    python train_v5.py --batch-size 6 --epochs 200 --lr 5e-5 \
+        --resume work_dirs/Desailly_v2/best_model.pth \
+        --work-dir work_dirs/Desailly_v5ft
 """
 
-import os
-import json
-import argparse
-import math
-import gc
+import os, json, argparse, math, gc, random
 from pathlib import Path
 from datetime import datetime
-import random
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from tqdm import tqdm
+import matplotlib;
+
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import cv2
-
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-
-# segmentation-models-pytorch pour l'encodeur pré-entraîné
-# pip install segmentation-models-pytorch
 import segmentation_models_pytorch as smp
 
 
 # ============================================================================
 # Dataset
 # ============================================================================
-
 class CadastreDataset(Dataset):
-    """Dataset pour images cadastrales + masques de segmentation"""
-
     def __init__(self, img_dir, mask_dir, transform=None):
         self.img_dir = Path(img_dir)
         self.mask_dir = Path(mask_dir)
         self.transform = transform
-
-        valid_extensions = {'.png', '.jpg', '.jpeg', '.tif', '.tiff'}
-        self.images = sorted([
-            f for f in self.img_dir.iterdir()
-            if f.suffix.lower() in valid_extensions
-        ])
-
-        print(f"📁 Dataset chargé: {len(self.images)} images depuis {img_dir}")
-        if len(self.images) == 0:
-            print("⚠️ ATTENTION: Aucune image trouvée !")
+        valid_ext = {'.png', '.jpg', '.jpeg', '.tif', '.tiff'}
+        self.images = sorted([f for f in self.img_dir.iterdir() if f.suffix.lower() in valid_ext])
+        print(f"📁 {len(self.images)} images depuis {img_dir}")
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, idx):
         img_path = self.images[idx]
-
-        # Recherche du masque (même stem, priorité .png)
         mask_path = self.mask_dir / (img_path.stem + ".png")
-        if not mask_path.exists():
-            mask_path = self.mask_dir / img_path.name
-        if not mask_path.exists():
-            raise FileNotFoundError(f"Masque introuvable pour {img_path}")
+        if not mask_path.exists(): mask_path = self.mask_dir / img_path.name
+        if not mask_path.exists(): raise FileNotFoundError(f"Masque introuvable: {img_path}")
 
-        # Chargement
         image = cv2.imread(str(img_path))
-        if image is None:
-            raise RuntimeError(f"Impossible de charger l'image: {img_path}")
+        if image is None: raise RuntimeError(f"Image illisible: {img_path}")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
         mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-        if mask is None:
-            raise RuntimeError(f"Impossible de charger le masque: {mask_path}")
-
-        # Binarisation stricte
+        if mask is None: raise RuntimeError(f"Masque illisible: {mask_path}")
         _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
         mask = mask.astype(np.float32) / 255.0
 
-        # Transformations conjointes
         if self.transform:
-            augmented = self.transform(image=image, mask=mask)
-            image = augmented['image']
-            mask = augmented['mask']
-
-        # Conversion en tensor si pas déjà fait
+            aug = self.transform(image=image, mask=mask)
+            image, mask = aug['image'], aug['mask']
         if not isinstance(image, torch.Tensor):
-            basic = ToTensorV2()
-            augmented = basic(image=image, mask=mask)
-            image = augmented['image']
-            mask = augmented['mask']
-
-        # Le masque doit être (1, H, W)
-        if mask.ndim == 2:
-            mask = mask.unsqueeze(0)
-
+            aug = ToTensorV2()(image=image, mask=mask)
+            image, mask = aug['image'], aug['mask']
+        if mask.ndim == 2: mask = mask.unsqueeze(0)
         return image, mask
 
 
 # ============================================================================
-# Modèle (U-Net vanilla comme fallback)
+# Model
 # ============================================================================
-
-class DoubleConv(nn.Module):
-    def __init__(self, in_channels, out_channels, dropout=0.0):
-        super().__init__()
-        layers = [
-            nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        ]
-        if dropout > 0:
-            layers.insert(3, nn.Dropout2d(dropout))
-        self.double_conv = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.double_conv(x)
-
-
-class UNetVanilla(nn.Module):
-    """U-Net basique avec dropout optionnel (si smp pas installé)"""
-
-    def __init__(self, n_channels=3, n_classes=1, base_filters=64):
-        super().__init__()
-        bf = base_filters
-        self.enc1 = DoubleConv(n_channels, bf)
-        self.pool1 = nn.MaxPool2d(2)
-        self.enc2 = DoubleConv(bf, bf * 2)
-        self.pool2 = nn.MaxPool2d(2)
-        self.enc3 = DoubleConv(bf * 2, bf * 4)
-        self.pool3 = nn.MaxPool2d(2)
-        self.enc4 = DoubleConv(bf * 4, bf * 8)
-        self.pool4 = nn.MaxPool2d(2)
-        self.bottleneck = DoubleConv(bf * 8, bf * 16, dropout=0.3)
-        self.up1 = nn.ConvTranspose2d(bf * 16, bf * 8, 2, stride=2)
-        self.dec1 = DoubleConv(bf * 16, bf * 8, dropout=0.2)
-        self.up2 = nn.ConvTranspose2d(bf * 8, bf * 4, 2, stride=2)
-        self.dec2 = DoubleConv(bf * 8, bf * 4, dropout=0.1)
-        self.up3 = nn.ConvTranspose2d(bf * 4, bf * 2, 2, stride=2)
-        self.dec3 = DoubleConv(bf * 4, bf * 2)
-        self.up4 = nn.ConvTranspose2d(bf * 2, bf, 2, stride=2)
-        self.dec4 = DoubleConv(bf * 2, bf)
-        self.out = nn.Conv2d(bf, n_classes, 1)
-
-    def forward(self, x):
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool1(e1))
-        e3 = self.enc3(self.pool2(e2))
-        e4 = self.enc4(self.pool3(e3))
-        b = self.bottleneck(self.pool4(e4))
-        d1 = self.dec1(torch.cat([self.up1(b), e4], 1))
-        d2 = self.dec2(torch.cat([self.up2(d1), e3], 1))
-        d3 = self.dec3(torch.cat([self.up3(d2), e2], 1))
-        d4 = self.dec4(torch.cat([self.up4(d3), e1], 1))
-        return self.out(d4)
-
-
-def build_model(encoder_name="resnet34", pretrained=True, n_classes=1):
-    """
-    Construit le modèle. Utilise smp si disponible, sinon UNet vanilla.
-
-    Encodeurs recommandés par ordre de performance/taille :
-    - resnet34 : bon compromis performance/vitesse (21M params)
-    - efficientnet-b3 : meilleur si GPU le permet (12M params, plus lent)
-    - resnet50 : plus lourd mais plus puissant (25M params)
-    """
-    try:
-        model = smp.Unet(
-            encoder_name=encoder_name,
-            encoder_weights="imagenet" if pretrained else None,
-            in_channels=3,
-            classes=n_classes,
-            decoder_attention_type="scse",  # Attention spatiale + canal
-        )
-        param_count = sum(p.numel() for p in model.parameters()) / 1e6
-        print(f"🧠 Modèle: U-Net + {encoder_name} (pré-entraîné={pretrained})")
-        print(f"   Paramètres: {param_count:.1f}M | Attention: scSE")
-        return model
-    except Exception as e:
-        print(f"⚠️ smp non disponible ({e}), fallback sur UNet vanilla")
-        return UNetVanilla(n_channels=3, n_classes=n_classes, base_filters=64)
+def build_model(encoder_name="resnet34", pretrained=True):
+    model = smp.Unet(encoder_name=encoder_name,
+                     encoder_weights="imagenet" if pretrained else None,
+                     in_channels=3, classes=1, decoder_attention_type="scse")
+    p = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f"🧠 U-Net + {encoder_name} | {p:.1f}M params | scSE")
+    return model
 
 
 # ============================================================================
-# Loss & Metrics
+# Loss v5 — Tversky + clDice + BCE
 # ============================================================================
-
-class CombinedLoss(nn.Module):
+class TverskyLoss(nn.Module):
     """
-    BCE + Dice combinées avec protections numériques.
+    Tversky Loss — généralisation de Dice avec contrôle P/R.
 
-    Changements vs v1 :
-    - Clamp des logits pour éviter les overflows dans exp()
-    - Smooth factor augmenté dans Dice pour stabilité
-    - pos_weight géré proprement sur le bon device dès l'init
+    Tversky Index = TP / (TP + alpha*FP + beta*FN)
+
+    - alpha=0.5, beta=0.5  → équivalent Dice
+    - alpha=0.7, beta=0.3  → pénalise les FP → meilleure precision
+    - alpha=0.3, beta=0.7  → pénalise les FN → meilleur recall
+
+    Pour les lignes cadastrales: alpha=0.6, beta=0.4 est un bon départ
+    (légère préférence precision pour des lignes plus fines)
     """
 
-    def __init__(self, bce_weight=0.5, pos_weight=5.0, device='cuda'):
+    def __init__(self, alpha=0.6, beta=0.4, smooth=1.0):
         super().__init__()
-        pw = torch.tensor([pos_weight], device=device)
-        self.bce = nn.BCEWithLogitsLoss(pos_weight=pw)
-        self.bce_weight = bce_weight
-        self.smooth = 1.0
-
-    def dice_loss(self, pred, target):
-        pred_sigmoid = torch.sigmoid(pred)
-        pred_flat = pred_sigmoid.reshape(-1)
-        target_flat = target.reshape(-1)
-        intersection = (pred_flat * target_flat).sum()
-        dice = (2.0 * intersection + self.smooth) / (
-                pred_flat.sum() + target_flat.sum() + self.smooth
-        )
-        return 1.0 - dice
+        self.alpha = alpha
+        self.beta = beta
+        self.smooth = smooth
 
     def forward(self, pred, target):
-        # Protection : clamper les logits pour éviter overflow dans BCEWithLogits
-        pred_clamped = torch.clamp(pred, min=-20.0, max=20.0)
+        pred_prob = torch.sigmoid(pred)
+        p_flat = pred_prob.reshape(-1)
+        t_flat = target.reshape(-1)
 
-        bce = self.bce(pred_clamped, target)
-        dice = self.dice_loss(pred_clamped, target)
+        tp = (p_flat * t_flat).sum()
+        fp = (p_flat * (1 - t_flat)).sum()
+        fn = ((1 - p_flat) * t_flat).sum()
 
-        loss = self.bce_weight * bce + (1.0 - self.bce_weight) * dice
-        return loss
+        tversky = (tp + self.smooth) / (
+                tp + self.alpha * fp + self.beta * fn + self.smooth
+        )
+        return 1.0 - tversky
 
 
+class FocalTverskyLoss(nn.Module):
+    """
+    Focal Tversky Loss — renforce le focus sur les cas difficiles.
+
+    FTL = (1 - Tversky)^gamma
+    gamma > 1 → focus sur les exemples mal classés (lignes fines, intersections)
+    """
+
+    def __init__(self, alpha=0.6, beta=0.4, gamma=1.5, smooth=1.0):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.smooth = smooth
+
+    def forward(self, pred, target):
+        pred_prob = torch.sigmoid(pred)
+        p_flat = pred_prob.reshape(-1)
+        t_flat = target.reshape(-1)
+
+        tp = (p_flat * t_flat).sum()
+        fp = (p_flat * (1 - t_flat)).sum()
+        fn = ((1 - p_flat) * t_flat).sum()
+
+        tversky = (tp + self.smooth) / (
+                tp + self.alpha * fp + self.beta * fn + self.smooth
+        )
+        return (1.0 - tversky) ** self.gamma
+
+
+class SoftSkeletonLoss(nn.Module):
+    """clDice via soft morphological skeletonization"""
+
+    def __init__(self, num_iters=5):
+        super().__init__()
+        self.num_iters = num_iters
+
+    def soft_erode(self, img):
+        return -F.max_pool2d(-img, 3, stride=1, padding=1)
+
+    def soft_dilate(self, img):
+        return F.max_pool2d(img, 3, stride=1, padding=1)
+
+    def soft_skeleton(self, img):
+        skel = F.relu(img - self.soft_dilate(self.soft_erode(img)))
+        for _ in range(self.num_iters):
+            img = self.soft_erode(img)
+            delta = F.relu(img - self.soft_dilate(self.soft_erode(img)))
+            skel = skel + F.relu(delta - skel * delta)
+        return skel
+
+    def forward(self, pred, target):
+        pred_prob = torch.sigmoid(pred)
+        skel_pred = self.soft_skeleton(pred_prob)
+        skel_target = self.soft_skeleton(target)
+        tprec = ((skel_pred * skel_target).sum() + 1.0) / (skel_pred.sum() + 1.0)
+        tsens = ((skel_pred * skel_target).sum() + 1.0) / (skel_target.sum() + 1.0)
+        return 1.0 - 2.0 * tprec * tsens / (tprec + tsens + 1e-7)
+
+
+class CombinedLossV5(nn.Module):
+    """
+    v5: Focal Tversky + clDice + BCE légère
+
+    - Focal Tversky (0.40): contrôle direct P/R + focus sur cas durs
+    - clDice (0.35): connectivité des lignes
+    - BCE (0.25): stabilité de base avec pos_weight modéré
+    """
+
+    def __init__(self, alpha=0.6, beta=0.4, gamma=1.5,
+                 pos_weight=3.0, device='cuda',
+                 tversky_w=0.40, skeleton_w=0.35, bce_w=0.25):
+        super().__init__()
+        self.focal_tversky = FocalTverskyLoss(alpha=alpha, beta=beta, gamma=gamma)
+        self.skeleton_loss = SoftSkeletonLoss(num_iters=5)
+        self.bce = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor([pos_weight], device=device)
+        )
+        self.tversky_w = tversky_w
+        self.skeleton_w = skeleton_w
+        self.bce_w = bce_w
+
+        print(f"📐 Loss v5: FocalTversky({tversky_w:.2f}, α={alpha}, β={beta}, γ={gamma}) "
+              f"+ Skel({skeleton_w:.2f}) + BCE({bce_w:.2f}, pw={pos_weight})")
+
+    def forward(self, pred, target):
+        p = torch.clamp(pred, -20.0, 20.0)
+        l_tversky = self.focal_tversky(p, target)
+        l_skel = self.skeleton_loss(p, target)
+        l_bce = self.bce(p, target)
+        return self.tversky_w * l_tversky + self.skeleton_w * l_skel + self.bce_w * l_bce
+
+
+# ============================================================================
+# Metrics
+# ============================================================================
 def calculate_iou(pred, target, threshold=0.5):
-    """IoU avec protection division par zéro"""
     with torch.no_grad():
-        pred_mask = (torch.sigmoid(pred) > threshold).float()
-        intersection = (pred_mask * target).sum()
-        union = pred_mask.sum() + target.sum() - intersection
-        if union == 0:
-            return 1.0
-        return (intersection / union).item()
+        pm = (torch.sigmoid(pred) > threshold).float()
+        inter = (pm * target).sum()
+        union = pm.sum() + target.sum() - inter
+        return 1.0 if union == 0 else (inter / union).item()
 
 
-def compute_pos_weight(dataset, num_samples=200):
-    """
-    Calcule le pos_weight optimal en analysant le ratio fond/lignes.
-    Utile pour ne pas deviner cette valeur.
-    """
-    total_pos = 0
-    total_neg = 0
-    indices = random.sample(range(len(dataset)), min(num_samples, len(dataset)))
-
-    for idx in indices:
-        _, mask = dataset[idx]
-        pos = mask.sum().item()
-        neg = mask.numel() - pos
-        total_pos += pos
-        total_neg += neg
-
-    if total_pos == 0:
-        print("⚠️ Aucun pixel positif trouvé ! Vérifiez vos masques.")
-        return 10.0
-
-    ratio = total_neg / total_pos
-    # On ne veut pas un poids trop extrême
-    pw = min(ratio, 30.0)
-    print(f"📊 Ratio négatif/positif: {ratio:.1f} → pos_weight recommandé: {pw:.1f}")
-    return pw
-
-
-# ============================================================================
-# Training & Validation
-# ============================================================================
-
-def train_epoch(model, loader, criterion, optimizer, device, use_amp=True):
-    """
-    Boucle d'entraînement d'une epoch.
-
-    Changements vs v1 :
-    - Suppression de GradScaler (incompatible bfloat16)
-    - Protection NaN : skip le batch si loss est NaN
-    - Gradient clipping toujours actif
-    """
-    model.train()
-    running_loss = 0.0
-    running_iou = 0.0
-    valid_batches = 0
-    nan_count = 0
-
-    pbar = tqdm(loader, desc="Train", leave=False)
-    for images, masks in pbar:
-        images = images.to(device, non_blocking=True)
-        masks = masks.to(device, non_blocking=True)
-
-        optimizer.zero_grad(set_to_none=True)  # Plus efficace que zero_grad()
-
-        if use_amp:
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                outputs = model(images)
-                loss = criterion(outputs, masks)
-        else:
-            outputs = model(images)
-            loss = criterion(outputs, masks)
-
-        # *** PROTECTION NaN ***
-        if torch.isnan(loss) or torch.isinf(loss):
-            nan_count += 1
-            if nan_count <= 3:
-                print(f"  ⚠️ NaN/Inf loss détecté (batch ignoré, {nan_count} fois)")
-            continue
-
-        # Backward sans GradScaler (bfloat16 n'en a pas besoin)
-        loss.backward()
-
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-        optimizer.step()
-
-        iou = calculate_iou(outputs.detach(), masks)
-        running_loss += loss.item()
-        running_iou += iou
-        valid_batches += 1
-
-        pbar.set_postfix({
-            'loss': f'{loss.item():.4f}',
-            'iou': f'{iou:.3f}'
-        })
-
-    if valid_batches == 0:
-        print("  ❌ TOUTE L'EPOCH A PRODUIT DES NaN ! Le modèle est probablement corrompu.")
-        return float('nan'), 0.0
-
-    if nan_count > 0:
-        print(f"  ⚠️ {nan_count} batchs ignorés pour NaN sur {valid_batches + nan_count} total")
-
-    return running_loss / valid_batches, running_iou / valid_batches
-
-
-@torch.no_grad()
-def validate(model, loader, criterion, device, use_amp=True):
-    """Validation avec protection NaN"""
-    model.eval()
-    running_loss = 0.0
-    running_iou = 0.0
-    valid_batches = 0
-
-    for images, masks in tqdm(loader, desc="Val", leave=False):
-        images = images.to(device, non_blocking=True)
-        masks = masks.to(device, non_blocking=True)
-
-        if use_amp:
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                outputs = model(images)
-                loss = criterion(outputs, masks)
-        else:
-            outputs = model(images)
-            loss = criterion(outputs, masks)
-
-        if torch.isnan(loss) or torch.isinf(loss):
-            continue
-
-        iou = calculate_iou(outputs, masks)
-        running_loss += loss.item()
-        running_iou += iou
-        valid_batches += 1
-
-    if valid_batches == 0:
-        return float('nan'), 0.0
-
-    return running_loss / valid_batches, running_iou / valid_batches
-
-
-# ============================================================================
-# Visualization
-# ============================================================================
-
-def save_debug_prediction(model, val_ds, device, epoch, work_dir, target_names=None):
-    """Sauvegarde des prédictions de debug pour visualiser la progression"""
-    model.eval()
-
-    if target_names is None:
-        # Prend 3 images au hasard si pas de noms spécifiques
-        n = min(3, len(val_ds))
-        found_indices = random.sample(range(len(val_ds)), n)
-    else:
-        found_indices = []
-        for i, img_path in enumerate(val_ds.images):
-            if img_path.stem in target_names:
-                found_indices.append(i)
-        if not found_indices:
-            # Fallback : premières images
-            found_indices = list(range(min(3, len(val_ds))))
-
-    n_images = len(found_indices)
-    fig, axes = plt.subplots(n_images, 3, figsize=(15, 5 * n_images))
-    if n_images == 1:
-        axes = np.expand_dims(axes, axis=0)
-
+def calculate_metrics(pred, target, threshold=0.5):
     with torch.no_grad():
-        for idx, ds_idx in enumerate(found_indices):
-            image, mask = val_ds[ds_idx]
-            input_tensor = image.unsqueeze(0).to(device)
-
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                output = torch.sigmoid(model(input_tensor)).cpu().float().numpy()[0, 0]
-
-            # Dénormalisation ImageNet
-            img_np = image.permute(1, 2, 0).numpy()
-            img_np = (img_np * np.array([0.229, 0.224, 0.225])) + np.array([0.485, 0.456, 0.406])
-            img_np = np.clip(img_np, 0, 1)
-
-            axes[idx, 0].imshow(img_np)
-            axes[idx, 0].set_title(f"Original: {val_ds.images[ds_idx].stem}", fontsize=8)
-            axes[idx, 1].imshow(mask.squeeze(), cmap='gray')
-            axes[idx, 1].set_title("Ground Truth")
-            axes[idx, 2].imshow(output > 0.4, cmap='gray')
-            axes[idx, 2].set_title(f"Prediction (Epoch {epoch})")
-
-            for ax in axes[idx]:
-                ax.axis('off')
-
-    plt.tight_layout()
-    plt.savefig(work_dir / f"debug_epoch_{epoch}.png", dpi=100)
-    plt.close()
+        pm = (torch.sigmoid(pred) > threshold).float()
+        tp = (pm * target).sum()
+        fp = (pm * (1 - target)).sum()
+        fn = ((1 - pm) * target).sum()
+        prec = tp / (tp + fp + 1e-8)
+        rec = tp / (tp + fn + 1e-8)
+        f1 = 2 * prec * rec / (prec + rec + 1e-8)
+        iou = tp / (tp + fp + fn + 1e-8)
+        return {'iou': iou.item(), 'precision': prec.item(),
+                'recall': rec.item(), 'f1': f1.item()}
 
 
 # ============================================================================
 # Augmentations
 # ============================================================================
-
-def get_train_transform(img_size=512):
-    """
-    Augmentations agressives pour gérer la diversité des feuilles cadastrales.
-
-    L'idée : forcer le réseau à ignorer les couleurs, textures du papier,
-    et se concentrer uniquement sur la structure des lignes.
-    """
+def get_train_transform(sz=512):
     return A.Compose([
-        A.Resize(img_size, img_size),
-
-        # --- Géométrie ---
+        A.Resize(sz, sz),
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
-        A.Rotate(limit=20, p=0.5, border_mode=cv2.BORDER_CONSTANT, value=0),
+        A.Rotate(limit=20, p=0.5, border_mode=cv2.BORDER_CONSTANT),
         A.RandomScale(scale_limit=0.15, p=0.3),
-        A.PadIfNeeded(img_size, img_size, border_mode=cv2.BORDER_CONSTANT, value=0),
-        A.RandomCrop(img_size, img_size, p=1.0),
-
-        # --- Couleur/Luminosité (ne s'applique qu'à l'image, pas au masque) ---
+        A.PadIfNeeded(sz, sz, border_mode=cv2.BORDER_CONSTANT),
+        A.RandomCrop(sz, sz, p=1.0),
         A.OneOf([
-            A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=1),
-            A.CLAHE(clip_limit=4.0, p=1),
-            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.3, hue=0.1, p=1),
+            A.RandomBrightnessContrast(0.3, 0.3, p=1),
+            A.CLAHE(4.0, p=1),
+            A.ColorJitter(0.2, 0.2, 0.3, 0.1, p=1),
         ], p=0.5),
-
-        # Simuler différents types de papier (jauni, blanchi, etc.)
         A.OneOf([
-            A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=1),
-            A.ToGray(p=1),  # Simuler des feuilles N&B
-            A.ChannelShuffle(p=1),  # Mélanger les canaux pour robustesse
+            A.HueSaturationValue(20, 30, 20, p=1),
+            A.ToGray(p=1),
+            A.ChannelShuffle(p=1),
         ], p=0.3),
-
-        # Bruit et flou (simuler la qualité de numérisation variable)
         A.OneOf([
-            A.GaussNoise(var_limit=(10, 50), p=1),
-            A.GaussianBlur(blur_limit=(3, 5), p=1),
+            A.GaussNoise(p=1),
+            A.GaussianBlur((3, 5), p=1),
         ], p=0.2),
-
-        # --- Normalisation ImageNet ---
+        A.ElasticTransform(alpha=50, sigma=10, p=0.15),
         A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ToTensorV2(),
     ])
 
 
-def get_val_transform(img_size=512):
-    """Transformations minimales pour la validation"""
+def get_val_transform(sz=512):
     return A.Compose([
-        A.Resize(img_size, img_size),
+        A.Resize(sz, sz),
         A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ToTensorV2(),
     ])
 
 
 # ============================================================================
-# Cosine Annealing avec Warmup
+# Train / Val
 # ============================================================================
+def train_epoch(model, loader, criterion, optimizer, device, amp=True):
+    model.train()
+    rl, ri, vb, nc = 0, 0, 0, 0
+    pbar = tqdm(loader, desc="Train", leave=False)
+    for imgs, masks in pbar:
+        imgs = imgs.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
 
-class CosineAnnealingWarmup:
-    """
-    Scheduler avec warmup linéaire puis cosine annealing.
-    Le warmup est crucial quand on reprend un entraînement sur un nouveau dataset.
-    """
+        if amp:
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                out = model(imgs)
+                loss = criterion(out.float(), masks)
+        else:
+            out = model(imgs);
+            loss = criterion(out, masks)
 
-    def __init__(self, optimizer, warmup_epochs, total_epochs, base_lr, min_lr=1e-6):
-        self.optimizer = optimizer
-        self.warmup_epochs = warmup_epochs
-        self.total_epochs = total_epochs
-        self.base_lr = base_lr
-        self.min_lr = min_lr
+        if torch.isnan(loss) or torch.isinf(loss):
+            nc += 1;
+            continue
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        rl += loss.item()
+        ri += calculate_iou(out.detach(), masks)
+        vb += 1
+        pbar.set_postfix({'loss': f'{loss.item():.4f}', 'iou': f'{ri / vb:.3f}'})
+
+    if nc: print(f"  ⚠️ {nc} NaN batchs")
+    return (rl / vb, ri / vb) if vb else (float('nan'), 0)
+
+
+@torch.no_grad()
+def validate(model, loader, criterion, device, amp=True):
+    model.eval()
+    rl, ms, vb = 0, {'iou': 0, 'precision': 0, 'recall': 0, 'f1': 0}, 0
+    for imgs, masks in tqdm(loader, desc="Val", leave=False):
+        imgs = imgs.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+        if amp:
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                out = model(imgs);
+                loss = criterion(out.float(), masks)
+        else:
+            out = model(imgs);
+            loss = criterion(out, masks)
+        if torch.isnan(loss): continue
+        m = calculate_metrics(out, masks)
+        rl += loss.item()
+        for k in ms: ms[k] += m[k]
+        vb += 1
+    if not vb: return float('nan'), 0, {}
+    return rl / vb, ms['iou'] / vb, {k: v / vb for k, v in ms.items()}
+
+
+# ============================================================================
+# Debug viz
+# ============================================================================
+def save_debug(model, ds, device, epoch, wd, names=None):
+    model.eval()
+    idxs = [i for i, p in enumerate(ds.images) if p.stem in (names or [])] if names else []
+    if not idxs: idxs = random.sample(range(len(ds)), min(3, len(ds)))
+    fig, ax = plt.subplots(len(idxs), 3, figsize=(15, 5 * len(idxs)))
+    if len(idxs) == 1: ax = np.expand_dims(ax, 0)
+    with torch.no_grad():
+        for i, di in enumerate(idxs):
+            img, msk = ds[di];
+            inp = img.unsqueeze(0).to(device)
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                out = torch.sigmoid(model(inp)).cpu().float().numpy()[0, 0]
+            im = img.permute(1, 2, 0).numpy()
+            im = np.clip((im * [.229, .224, .225]) + [.485, .456, .406], 0, 1)
+            ax[i, 0].imshow(im);
+            ax[i, 0].set_title(f"Orig: {ds.images[di].stem}", fontsize=8)
+            ax[i, 1].imshow(msk.squeeze(), cmap='gray');
+            ax[i, 1].set_title("GT")
+            ax[i, 2].imshow(out > 0.5, cmap='gray');
+            ax[i, 2].set_title(f"Pred (Ep {epoch})")
+            for a in ax[i]: a.axis('off')
+    plt.tight_layout();
+    plt.savefig(wd / f"debug_epoch_{epoch}.png", dpi=100);
+    plt.close()
+
+
+# ============================================================================
+# Scheduler
+# ============================================================================
+class CosineScheduler:
+    def __init__(self, opt, warmup, total, base_lr, min_lr=1e-6):
+        self.opt, self.warmup, self.total = opt, warmup, total
+        self.base_lr, self.min_lr = base_lr, min_lr
 
     def step(self, epoch):
-        if epoch < self.warmup_epochs:
-            # Warmup linéaire
-            lr = self.base_lr * (epoch + 1) / self.warmup_epochs
+        if epoch < self.warmup:
+            lr = self.base_lr * (epoch + 1) / self.warmup
         else:
-            # Cosine annealing
-            progress = (epoch - self.warmup_epochs) / max(1, self.total_epochs - self.warmup_epochs)
-            lr = self.min_lr + 0.5 * (self.base_lr - self.min_lr) * (1 + math.cos(math.pi * progress))
-
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = lr
+            prog = (epoch - self.warmup) / max(1, self.total - self.warmup)
+            lr = self.min_lr + 0.5 * (self.base_lr - self.min_lr) * (1 + math.cos(math.pi * prog))
+        for pg in self.opt.param_groups:
+            pg['lr'] = lr * pg.get('initial_lr_ratio', 1.0)
         return lr
-
-
-# ============================================================================
-# Vérification du dataset
-# ============================================================================
-
-def verify_dataset(dataset, num_checks=20):
-    """
-    Vérifie que le dataset est cohérent avant de lancer l'entraînement.
-    Détecte : masques tout noir, images corrompues, tailles incohérentes.
-    """
-    print(f"\n🔍 Vérification du dataset ({num_checks} échantillons)...")
-    all_black = 0
-    errors = 0
-    sizes = set()
-
-    indices = random.sample(range(len(dataset)), min(num_checks, len(dataset)))
-
-    for idx in indices:
-        try:
-            img, mask = dataset[idx]
-            sizes.add((img.shape[1], img.shape[2]))
-
-            if mask.sum() == 0:
-                all_black += 1
-                if all_black <= 5:
-                    print(f"  ⚠️ Masque tout noir: {dataset.images[idx].name}")
-        except Exception as e:
-            errors += 1
-            print(f"  ❌ Erreur sur {dataset.images[idx].name}: {e}")
-
-    if errors > 0:
-        print(f"  ❌ {errors} images/masques corrompus détectés !")
-    if all_black > num_checks * 0.5:
-        print(f"  ⚠️ {all_black}/{num_checks} masques sont tout noirs. Vérifiez vos labels !")
-    if len(sizes) > 1:
-        print(f"  ⚠️ Tailles d'images hétérogènes détectées: {sizes}")
-    else:
-        print(f"  ✅ Dataset OK | Tailles: {sizes} | Masques noirs: {all_black}/{num_checks}")
-
-    return errors == 0
 
 
 # ============================================================================
 # Main
 # ============================================================================
-
 def main():
-    parser = argparse.ArgumentParser(description="Entraînement segmentation cadastrale v2")
-    parser.add_argument('--data-root', default='data/cadastre_lines')
-    parser.add_argument('--work-dir', default='work_dirs/unet_v2')
-    parser.add_argument('--resume', type=str, default=None, help='Checkpoint à reprendre')
-    parser.add_argument('--epochs', type=int, default=200)
-    parser.add_argument('--batch-size', type=int, default=8)
-    parser.add_argument('--lr', type=float, default=3e-4,
-                        help='Learning rate (recommandé: 3e-4 avec encodeur pré-entraîné)')
-    parser.add_argument('--pos-weight', type=float, default=0, help='0 = calcul automatique')
-    parser.add_argument('--img-size', type=int, default=512)
-    parser.add_argument('--encoder', type=str, default='resnet34',
-                        help='Encodeur: resnet34, resnet50, efficientnet-b3, etc.')
-    parser.add_argument('--no-pretrained', action='store_true', help='Ne pas utiliser ImageNet')
-    parser.add_argument('--no-amp', action='store_true', help='Désactiver mixed precision')
-    parser.add_argument('--warmup-epochs', type=int, default=5)
-    parser.add_argument('--patience', type=int, default=30, help='Early stopping patience')
-    parser.add_argument('--debug-names', nargs='*', default=None,
-                        help='Noms des images de debug (stems)')
-    args = parser.parse_args()
+    P = argparse.ArgumentParser(description="Cadastre v5 - Tversky + Topology Loss")
+    P.add_argument('--data-root', default='data/cadastre_lines')
+    P.add_argument('--work-dir', default='work_dirs/unet_v5')
+    P.add_argument('--resume', type=str, default=None)
+    P.add_argument('--epochs', type=int, default=300)
+    P.add_argument('--batch-size', type=int, default=8)
+    P.add_argument('--lr', type=float, default=3e-4)
+    P.add_argument('--img-size', type=int, default=512)
+    P.add_argument('--encoder', default='resnet34')
+    P.add_argument('--no-pretrained', action='store_true')
+    P.add_argument('--no-amp', action='store_true')
+    P.add_argument('--warmup-epochs', type=int, default=5)
+    P.add_argument('--patience', type=int, default=50)
+    P.add_argument('--debug-names', nargs='*', default=None)
 
-    work_dir = Path(args.work_dir)
-    work_dir.mkdir(parents=True, exist_ok=True)
+    # Tversky params
+    P.add_argument('--alpha', type=float, default=0.3,
+                   help='Tversky alpha (pénalise FP)')
+    P.add_argument('--beta', type=float, default=0.7,
+                   help='Tversky beta (pénalise FN, >0.5 indispensable pour fermer les polygones)')
+    P.add_argument('--gamma', type=float, default=1.5,
+                   help='Focal gamma (>1 = focus sur cas durs)')
+    P.add_argument('--pos-weight', type=float, default=2.0,
+                   help='BCE pos_weight')
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    use_amp = not args.no_amp and device.type == 'cuda'
-    print(f"🚀 Device: {device} | AMP (bfloat16): {use_amp}")
+    # Ajouts pour la logique SoDUCO (Contrôle des poids de la Loss)
+    P.add_argument('--w-tversky', type=float, default=0.2, help='Poids de la Tversky Loss')
+    P.add_argument('--w-skel', type=float, default=0.6, help='Poids de la Topological/Skeleton Loss')
+    P.add_argument('--w-bce', type=float, default=0.2, help='Poids de la BCE Loss')
 
-    # --- TRANSFORMS ---
-    train_transform = get_train_transform(args.img_size)
-    val_transform = get_val_transform(args.img_size)
+    args = P.parse_args()
 
-    # --- DATASETS ---
-    data_root = Path(args.data_root)
-    train_ds = CadastreDataset(data_root / 'images' / 'train', data_root / 'labels' / 'train', train_transform)
-    val_ds = CadastreDataset(data_root / 'images' / 'val', data_root / 'labels' / 'val', val_transform)
+    wd = Path(args.work_dir);
+    wd.mkdir(parents=True, exist_ok=True)
+    dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    amp = not args.no_amp and dev.type == 'cuda'
+    print(f"🚀 {dev} | AMP: {amp}")
 
-    # Vérification du dataset
-    verify_dataset(train_ds)
-    verify_dataset(val_ds)
+    dr = Path(args.data_root)
+    train_ds = CadastreDataset(dr / 'images' / 'train', dr / 'labels' / 'train', get_train_transform(args.img_size))
+    val_ds = CadastreDataset(dr / 'images' / 'val', dr / 'labels' / 'val', get_val_transform(args.img_size))
 
-    # --- DATALOADERS ---
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=4, pin_memory=True, drop_last=True,
-        persistent_workers=True
+    tl = DataLoader(train_ds, args.batch_size, shuffle=True,
+                    num_workers=4, pin_memory=True, drop_last=True, persistent_workers=True)
+    vl = DataLoader(val_ds, args.batch_size,
+                    num_workers=2, pin_memory=True, persistent_workers=True)
+
+    model = build_model(args.encoder, not args.no_pretrained).to(dev)
+
+    crit = CombinedLossV5(
+        alpha=args.alpha, beta=args.beta, gamma=args.gamma,
+        pos_weight=args.pos_weight, device=dev,
+        tversky_w=args.w_tversky, skeleton_w=args.w_skel, bce_w=args.w_bce
     )
-    val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=2, pin_memory=True,
-        persistent_workers=True
-    )
 
-    # --- MODÈLE ---
-    model = build_model(
-        encoder_name=args.encoder,
-        pretrained=not args.no_pretrained,
-        n_classes=1
-    ).to(device)
-
-    # --- CALCUL pos_weight ---
-    if args.pos_weight <= 0:
-        pw = compute_pos_weight(train_ds)
-    else:
-        pw = args.pos_weight
-        print(f"📊 pos_weight manuel: {pw}")
-
-    criterion = CombinedLoss(pos_weight=pw, device=device)
-
-    # --- OPTIMIZER ---
-    # Différencier le LR encodeur vs décodeur (fine-tuning)
     if hasattr(model, 'encoder'):
-        encoder_params = list(model.encoder.parameters())
-        decoder_params = [p for p in model.parameters() if not any(p is ep for ep in encoder_params)]
-        optimizer = optim.AdamW([
-            {'params': encoder_params, 'lr': args.lr * 0.1},  # Encodeur : LR plus bas
-            {'params': decoder_params, 'lr': args.lr},  # Décodeur : LR normal
+        ep_list = list(model.encoder.parameters())
+        dp_list = [p for p in model.parameters() if not any(p is e for e in ep_list)]
+        opt = optim.AdamW([
+            {'params': ep_list, 'lr': args.lr * 0.1, 'initial_lr_ratio': 0.1},
+            {'params': dp_list, 'lr': args.lr, 'initial_lr_ratio': 1.0},
         ], weight_decay=1e-2)
-        print(f"📐 LR différencié: encodeur={args.lr * 0.1:.2e}, décodeur={args.lr:.2e}")
+        print(f"📐 LR: enc={args.lr * 0.1:.2e} dec={args.lr:.2e}")
     else:
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
+        opt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
 
-    scheduler = CosineAnnealingWarmup(
-        optimizer, args.warmup_epochs, args.epochs, args.lr
-    )
+    sched = CosineScheduler(opt, args.warmup_epochs, args.epochs, args.lr)
 
-    # --- RESUME ---
-    start_epoch = 1
     best_iou = 0.0
-
     if args.resume and os.path.isfile(args.resume):
-        print(f"🔄 Chargement du checkpoint: {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+        print(f"🔄 Loading: {args.resume}")
+        ck = torch.load(args.resume, map_location=dev, weights_only=False)
+        if isinstance(ck, dict) and 'model_state_dict' in ck:
+            miss, _ = model.load_state_dict(ck['model_state_dict'], strict=False)
+            if miss: print(f"  ⚠️ {len(miss)} missing keys")
+            prev = ck.get('best_iou', 0);
+            ep_prev = ck.get('epoch', '?')
+            print(f"  ✅ Poids chargés (ep {ep_prev}, IoU {prev:.4f})")
+        elif isinstance(ck, dict):
+            model.load_state_dict(ck, strict=False)
 
-        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            # Chargement flexible (permet des différences d'architecture)
-            state_dict = checkpoint['model_state_dict']
-            missing, unexpected = model.load_state_dict(state_dict, strict=False)
-            if missing:
-                print(f"  ⚠️ Clés manquantes: {len(missing)} (normal si architecture différente)")
-            if unexpected:
-                print(f"  ⚠️ Clés inattendues: {len(unexpected)}")
-            start_epoch = checkpoint.get('epoch', 0) + 1
-            best_iou = checkpoint.get('best_iou', 0.0)
-            print(f"  ✅ Reprise epoch {start_epoch}, best IoU: {best_iou:.4f}")
-        elif isinstance(checkpoint, dict):
-            # Essai direct comme state_dict
-            missing, unexpected = model.load_state_dict(checkpoint, strict=False)
-            print(f"  ⚠️ Poids seuls chargés (pas d'historique)")
-        else:
-            print(f"  ❌ Format de checkpoint non reconnu")
-    elif args.resume:
-        print(f"  ❌ Fichier non trouvé: {args.resume}")
+    lf = wd / "train_log.csv"
+    lf.write_text("epoch,time,lr,train_loss,train_iou,val_loss,val_iou,precision,recall,f1\n")
+    (wd / "config.json").write_text(json.dumps(vars(args), indent=2))
 
-    # --- LOGGING ---
-    log_file = work_dir / "train_log.csv"
-    if not log_file.exists() or start_epoch == 1:
-        with open(log_file, "w") as f:
-            f.write("epoch,time,lr,train_loss,train_iou,val_loss,val_iou\n")
+    pc, nc = 0, 0
+    print(f"\n🎯 v5: {len(train_ds)} train, {len(val_ds)} val")
+    print(f"   {args.epochs} ep | batch={args.batch_size} | patience={args.patience}")
+    print(f"   Tversky α={args.alpha} β={args.beta} γ={args.gamma}\n")
 
-    # Sauvegarder la config
-    config = vars(args)
-    config['pos_weight_used'] = pw
-    config['model_params'] = sum(p.numel() for p in model.parameters())
-    with open(work_dir / "config.json", "w") as f:
-        json.dump(config, f, indent=2)
-
-    # --- BOUCLE D'ENTRAÎNEMENT ---
-    patience_counter = 0
-    nan_epoch_count = 0
-
-    print(f"\n🎯 Début entraînement: {len(train_ds)} train, {len(val_ds)} val, {args.epochs} epochs")
-    print(f"   Batch size: {args.batch_size} | Image size: {args.img_size}")
-    print(f"   Patience early stopping: {args.patience} epochs\n")
-
-    for epoch in range(start_epoch, args.epochs + 1):
+    for ep in range(1, args.epochs + 1):
         now = datetime.now().strftime("%H:%M:%S")
-        current_lr = scheduler.step(epoch - 1)
+        lr = sched.step(ep - 1)
+        print(f"\n🔔 Ep {ep}/{args.epochs} | {now} | LR: {lr:.2e}")
 
-        print(f"\n🔔 Epoch {epoch}/{args.epochs} | 🕒 {now} | 🚀 LR: {current_lr:.2e}")
+        tl_, ti = train_epoch(model, tl, crit, opt, dev, amp)
+        vl_, vi, vm = validate(model, vl, crit, dev, amp)
 
-        # Train
-        t_loss, t_iou = train_epoch(model, train_loader, criterion, optimizer, device, use_amp)
-
-        # Validation
-        v_loss, v_iou = validate(model, val_loader, criterion, device, use_amp)
-
-        # Protection : si le train produit uniquement des NaN
-        if math.isnan(t_loss):
-            nan_epoch_count += 1
-            print(f"  ❌ Epoch entière NaN ({nan_epoch_count}/3)")
-            if nan_epoch_count >= 3:
-                print("  💀 3 epochs NaN consécutives. Arrêt de l'entraînement.")
-                print("     → Vérifiez votre dataset et réduisez le learning rate.")
-                break
+        if math.isnan(tl_):
+            nc += 1
+            if nc >= 3: print("💀 3x NaN. Stop."); break
             continue
-        else:
-            nan_epoch_count = 0
+        nc = 0
 
-        # Debug images (toutes les 5 epochs ou les 10 premières)
-        if epoch <= 10 or epoch % 5 == 0:
-            print(f"  📸 Debug image epoch {epoch}...")
-            save_debug_prediction(model, val_ds, device, epoch, work_dir, args.debug_names)
+        if ep <= 10 or ep % 5 == 0:
+            save_debug(model, val_ds, dev, ep, wd, args.debug_names)
 
-        # Affichage
-        print(f"  📊 T_Loss: {t_loss:.4f} T_IoU: {t_iou:.4f} | V_Loss: {v_loss:.4f} V_IoU: {v_iou:.4f}")
+        p = vm.get('precision', 0) if vm else 0
+        r = vm.get('recall', 0) if vm else 0
+        f1 = vm.get('f1', 0) if vm else 0
+        print(f"  📊 TL:{tl_:.4f} TI:{ti:.4f} | VL:{vl_:.4f} VI:{vi:.4f} "
+              f"P:{p:.3f} R:{r:.3f} F1:{f1:.3f}")
 
-        # CSV
-        with open(log_file, "a") as f:
-            f.write(f"{epoch},{now},{current_lr:.2e},{t_loss:.4f},{t_iou:.4f},{v_loss:.4f},{v_iou:.4f}\n")
+        with open(lf, "a") as f:
+            f.write(f"{ep},{now},{lr:.2e},{tl_:.4f},{ti:.4f},{vl_:.4f},{vi:.4f},"
+                    f"{p:.4f},{r:.4f},{f1:.4f}\n")
 
-        # Meilleur modèle
-        if not math.isnan(v_iou) and v_iou > best_iou:
-            best_iou = v_iou
-            patience_counter = 0
+        if not math.isnan(vi) and vi > best_iou:
+            best_iou = vi;
+            pc = 0
             torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'best_iou': best_iou,
-                'config': {
-                    'encoder': args.encoder,
-                    'img_size': args.img_size,
-                    'pos_weight': pw,
-                }
-            }, work_dir / 'best_model.pth')
-            print(f"  ⭐ Nouveau record IoU: {best_iou:.4f}")
+                'epoch': ep, 'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': opt.state_dict(), 'best_iou': best_iou,
+                'config': {'encoder': args.encoder, 'img_size': args.img_size,
+                           'alpha': args.alpha, 'beta': args.beta}
+            }, wd / 'best_model.pth')
+            print(f"  ⭐ Best IoU: {best_iou:.4f}")
         else:
-            patience_counter += 1
+            pc += 1
 
-        # Checkpoint de sécurité
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'best_iou': best_iou,
-        }, work_dir / 'latest.pth')
+        torch.save({'epoch': ep, 'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': opt.state_dict(), 'best_iou': best_iou},
+                   wd / 'latest.pth')
 
-        # Early stopping
-        if patience_counter >= args.patience:
-            print(f"\n⏹️ Early stopping après {args.patience} epochs sans amélioration.")
-            print(f"   Meilleur IoU: {best_iou:.4f}")
+        if pc >= args.patience:
+            print(f"\n⏹️ Early stop. Best: {best_iou:.4f}");
             break
 
-        gc.collect()
+        gc.collect();
         torch.cuda.empty_cache()
 
-    # --- COURBES FINALES ---
+    # Courbes
     try:
         import pandas as pd
-        df = pd.read_csv(log_file)
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-        ax1.plot(df['epoch'], df['train_loss'], label='Train Loss')
-        ax1.plot(df['epoch'], df['val_loss'], label='Val Loss')
-        ax1.set_xlabel('Epoch')
-        ax1.set_ylabel('Loss')
-        ax1.legend()
-        ax1.set_title('Loss')
-        ax2.plot(df['epoch'], df['train_iou'], label='Train IoU')
-        ax2.plot(df['epoch'], df['val_iou'], label='Val IoU')
-        ax2.set_xlabel('Epoch')
-        ax2.set_ylabel('IoU')
-        ax2.legend()
-        ax2.set_title('IoU')
-        plt.tight_layout()
-        plt.savefig(work_dir / 'metrics.png', dpi=150)
+        df = pd.read_csv(lf)
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        axes[0].plot(df['epoch'], df['train_iou'], alpha=0.5, label='Train')
+        axes[0].plot(df['epoch'], df['val_iou'], alpha=0.5, label='Val')
+        axes[0].plot(df['epoch'], df['val_iou'].rolling(10).mean(), lw=2, label='Val avg10')
+        axes[0].legend();
+        axes[0].set_title('IoU');
+        axes[0].grid(True, alpha=0.3)
+        axes[1].plot(df['epoch'], df['train_loss'], alpha=0.5, label='Train')
+        axes[1].plot(df['epoch'], df['val_loss'], alpha=0.5, label='Val')
+        axes[1].legend();
+        axes[1].set_title('Loss');
+        axes[1].grid(True, alpha=0.3)
+        axes[2].plot(df['epoch'], df['precision'], label='Precision')
+        axes[2].plot(df['epoch'], df['recall'], label='Recall')
+        axes[2].plot(df['epoch'], df['val_iou'], label='IoU', ls='--')
+        axes[2].legend();
+        axes[2].set_title('P / R / IoU');
+        axes[2].grid(True, alpha=0.3)
+        plt.tight_layout();
+        plt.savefig(wd / 'metrics.png', dpi=150);
         plt.close()
-    except ImportError:
-        print("  (pandas non disponible pour les courbes finales)")
+    except:
+        pass
 
-    print(f"\n✅ Entraînement terminé. Meilleur IoU: {best_iou:.4f}")
-    print(f"   Modèle sauvegardé: {work_dir / 'best_model.pth'}")
+    print(f"\n✅ Done. Best IoU: {best_iou:.4f}")
 
 
 if __name__ == '__main__':
