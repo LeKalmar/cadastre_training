@@ -1,0 +1,16 @@
+data/tools/annotation/annotation_cadastre.zip
+data/
+resultats/
+work_dirs/
+annotation_parcelles/
+*.bak*
+*.anti_chevauchement_non_utilise
+predictions/
+logs/
+annotations/
+__pycache__/
+.claude/
+.idea/
+.venv/
+.venv-georef/
+debug_output/

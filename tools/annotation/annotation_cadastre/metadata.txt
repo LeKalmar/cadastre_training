@@ -1,0 +1,15 @@
+[general]
+name=Annotation cadastrale
+qgisMinimumVersion=3.28
+description=Validation rapide des propositions IA du projet d'annotation cadastrale (touches 1 à 9, outil clic, sommets, transport de développement, filtre par feuille).
+about=Barre d'outils « Validation annotation » pour le projet annotation_parcelles/annotation.qgz (base PostGIS cadastre_annotation). Touches actives quand la carte a le focus : 1 valider, 2 rejeter (motif), 3 remettre à valider, 4 suivante, 5 outil clic, 6 sommets, 7 transporter un développement, 8 feuille sous la souris, 9 toutes les feuilles. Outil personnel, non distribué.
+version=1.0.0
+author=LeKalmar
+email=noreply@example.invalid
+category=Vector
+icon=icon.svg
+experimental=False
+deprecated=False
+server=False
+hasProcessingProvider=no
+tags=cadastre,annotation,validation,postgis
