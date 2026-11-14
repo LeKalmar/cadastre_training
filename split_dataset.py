@@ -54,4 +54,4 @@ def split_dataset(source_dir, train_ratio=0.85):
 if __name__ == "__main__":
     # Source : le dossier où tu as tes tuiles nettoyées
     # Ratio : 0.85 signifie 85% train, 15% validation
-    split_dataset("data/cadastre_lines_tiled", train_ratio=0.85)
+    split_dataset("data/cadastre_lines_tiled_1024", train_ratio=0.85)
